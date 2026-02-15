@@ -1,10 +1,49 @@
-import ollama
+"""Fastener image analysis demo using a two-pass vision workflow.
+
+Pipeline summary:
+1) Ask a vision model to detect hardware parts and return bounding boxes.
+2) Normalize and sort detections to generate stable numeric IDs.
+3) Draw labeled boxes on the source image.
+4) Ask a second vision pass to enrich each ID with better labels/specs/confidence.
+5) Render a readable side-panel table and save as output_labeled.jpg.
+"""
+
 import json
 import os
 import re
+from typing import Any
+
+import ollama
 
 from PIL import Image, ImageDraw, ImageFont
 
+# -----------------------------------------------------------------------------
+# Model prompts
+# -----------------------------------------------------------------------------
+DETECTION_PROMPT = (
+    "Locate all hardware items. Return ONLY a JSON list of objects. "
+    "Each object must have: "
+    '"label" (hardware type), '
+    '"specification" (short hardware spec or "unknown"), '
+    '"box_2d" object with keys x1,y1,x2,y2 in XYXY order, '
+    "normalized to 0-1000 relative to the FULL original image. "
+    'Also include "box_order":"xyxy".'
+)
+
+ENRICHMENT_PROMPT_TEMPLATE = (
+    "You are validating numbered fastener detections in the attached image. "
+    "Each detection already has an ID and rough label. "
+    "For each ID, output best canonical hardware label and a concise practical specification. "
+    "Use only what is visible. Do not invent exact standards or thread pitch unless clearly legible. "
+    'If uncertain, keep generic terms and use "unknown" where needed. '
+    "Return ONLY a JSON array with objects containing: "
+    '"id" (int), "label" (string), "specification" (string), "confidence" (0-1). '
+    "Input detections: {payload_json}"
+)
+
+# -----------------------------------------------------------------------------
+# Visual style constants
+# -----------------------------------------------------------------------------
 # Visual style constants
 BOX_COLOR = (230, 40, 40)
 BOX_WIDTH = 4
@@ -26,7 +65,15 @@ TABLE_BODY_FONT_SIZE = 19
 ID_FONT_SIZE = 36
 
 
-def _extract_json_array(raw_content: str):
+def _extract_json_array(raw_content: str) -> list[dict[str, Any]]:
+    """Parse a detection JSON list from noisy model output.
+
+    This parser is intentionally resilient because model output can include:
+    - markdown code fences,
+    - trailing commas,
+    - malformed numbers (e.g. "392.777.777"),
+    - partial/truncated JSON.
+    """
     def _is_detection_list(obj):
         return isinstance(obj, list) and any(
             isinstance(it, dict) and ("label" in it or "box_2d" in it) for it in obj
@@ -138,6 +185,7 @@ def _extract_json_array(raw_content: str):
 
 
 def _to_float(value, default=0.0):
+    """Best-effort numeric cast with default fallback."""
     try:
         return float(value)
     except Exception:
@@ -145,6 +193,7 @@ def _to_float(value, default=0.0):
 
 
 def _load_font(size):
+    """Load a readable font with fallback for cross-platform environments."""
     candidates = [
         "arial.ttf",
         "Arial.ttf",
@@ -159,6 +208,7 @@ def _load_font(size):
 
 
 def _scale_box_xyxy(x1, y1, x2, y2, width, height):
+    """Scale XYXY boxes from normalized space into pixel space."""
     max_val = max(x1, y1, x2, y2)
     if max_val <= 1.0:
         left = x1 * width
@@ -180,12 +230,13 @@ def _scale_box_xyxy(x1, y1, x2, y2, width, height):
 
 
 def _normalize_box(entry, width, height):
-    """
+    """Normalize all supported model box formats to pixel XYXY.
+
     Preferred format:
       "box_2d": {"x1":..., "y1":..., "x2":..., "y2":...}
-    Backward compatible list format:
+    Backward-compatible list format:
       "box_2d": [a, b, c, d], interpreted as xyxy by default.
-      If "box_order" is present and equals "yxyx", map as [y1, x1, y2, x2].
+      If "box_order" is "yxyx", it is mapped as [y1, x1, y2, x2].
     """
     box_2d = entry.get("box_2d")
     if box_2d is None:
@@ -212,11 +263,13 @@ def _normalize_box(entry, width, height):
 
 
 def _format_bbox(box):
+    """Convert a pixel box tuple into compact table text."""
     left, top, right, bottom = box
     return f"({int(left)},{int(top)})-({int(right)},{int(bottom)})"
 
 
 def _fit_text(draw, text, font, max_width):
+    """Truncate text to fit a column width using ellipsis."""
     s = str(text)
     if draw.textlength(s, font=font) <= max_width:
         return s
@@ -235,6 +288,7 @@ def _fit_text(draw, text, font, max_width):
 
 
 def _wrap_text_by_pixels(draw, text, font, max_width, max_lines):
+    """Word-wrap text by pixel width and clamp to max lines."""
     words = str(text).split()
     if not words:
         return [""]
@@ -256,6 +310,7 @@ def _wrap_text_by_pixels(draw, text, font, max_width, max_lines):
 
 
 def _draw_table(draw, x_start, y_start, rows, font, header_font):
+    """Draw a fixed-grid, readable results table on the side panel."""
     headers = ["ID", "Label", "Specification", "Conf", "Box (px)"]
     col_widths = [74, 220, 520, 90, 360]
     pad_x = 12
@@ -310,7 +365,8 @@ def _draw_table(draw, x_start, y_start, rows, font, header_font):
         y += row_height
 
 
-def _draw_numbered_detections(img, detections, font, id_font):
+def _draw_numbered_detections(img, detections, id_font):
+    """Draw detection boxes and large numeric ID badges on the image."""
     draw = ImageDraw.Draw(img)
     for i, det in enumerate(detections, 1):
         left, top, right, bottom = det["box"]
@@ -331,6 +387,7 @@ def _draw_numbered_detections(img, detections, font, id_font):
 
 
 def _heuristic_specification(label, box, width, height):
+    """Fallback spec text when the model provides low-detail/unknown specs."""
     left, top, right, bottom = box
     w = max(1.0, right - left)
     h = max(1.0, bottom - top)
@@ -355,6 +412,7 @@ def _heuristic_specification(label, box, width, height):
 
 
 def _enrich_detections_with_model(numbered_image_path, detections):
+    """Second-pass model call to refine label/specification per detection ID."""
     payload = []
     for i, det in enumerate(detections, 1):
         payload.append({
@@ -363,20 +421,12 @@ def _enrich_detections_with_model(numbered_image_path, detections):
             "box_px": [int(det["box"][0]), int(det["box"][1]), int(det["box"][2]), int(det["box"][3])],
         })
 
+    prompt = ENRICHMENT_PROMPT_TEMPLATE.format(payload_json=json.dumps(payload))
     response = ollama.chat(
         model='qwen3-vl',
         messages=[{
             'role': 'user',
-            'content': (
-                'You are validating numbered fastener detections in the attached image. '
-                'Each detection already has an ID and rough label. '
-                'For each ID, output best canonical hardware label and a concise practical specification. '
-                'Use only what is visible. Do not invent exact standards or thread pitch unless clearly legible. '
-                'If uncertain, keep generic terms and use "unknown" where needed. '
-                'Return ONLY a JSON array with objects containing: '
-                '"id" (int), "label" (string), "specification" (string), "confidence" (0-1). '
-                f'Input detections: {json.dumps(payload)}'
-            ),
+            'content': prompt,
             'images': [numbered_image_path]
         }]
     )
@@ -397,34 +447,27 @@ def _enrich_detections_with_model(numbered_image_path, detections):
 
 
 def run_test():
-    # 1. Ask Qwen3-VL to find the hardware
+    """Run full detection + enrichment + visualization pipeline."""
+    # Step 1: Ask the vision model to detect all hardware in the image.
     print("Analyzing image with qwen3-vl...")
     response = ollama.chat(
         model='qwen3-vl',
         messages=[{
             'role': 'user',
-            'content': (
-                'Locate all hardware items. Return ONLY a JSON list of objects. '
-                'Each object must have: '
-                '"label" (hardware type), '
-                '"specification" (short hardware spec or "unknown"), '
-                '"box_2d" object with keys x1,y1,x2,y2 in XYXY order, '
-                'normalized to 0-1000 relative to the FULL original image. '
-                'Also include "box_order":"xyxy".'
-            ),
+            'content': DETECTION_PROMPT,
             'images': ['hardware.jpg']
         }]
     )
 
-    # 2. Extract the text response
+    # Step 2: Capture raw model text before parsing (useful for debugging).
     raw_content = response['message']['content']
     print(f"Model Response: {raw_content}")
 
-    # 3. Open the image
+    # Step 3: Load the input image used for drawing and coordinate scaling.
     img = Image.open('hardware.jpg')
     width, height = img.size
 
-    # 4. Parse the JSON (Models often wrap JSON in code blocks)
+    # Step 4: Parse model JSON, normalize boxes, and build detection list.
     try:
         data = _extract_json_array(raw_content)
         title_font = _load_font(TITLE_FONT_SIZE)
@@ -445,12 +488,12 @@ def run_test():
                 "box": (left, top, right, bottom),
             })
 
-        # Stable numbering by image position (top-to-bottom, left-to-right).
+        # Stable numbering: top-to-bottom, then left-to-right.
         detections.sort(key=lambda d: (d["box"][1], d["box"][0]))
 
-        # Draw numbered detections first and run a second pass classifier.
+        # Draw numbered detections, then run second-pass enrichment.
         numbered_img = img.copy()
-        _draw_numbered_detections(numbered_img, detections, table_body_font, id_font)
+        _draw_numbered_detections(numbered_img, detections, id_font)
         numbered_img_path = 'output_numbered_tmp.jpg'
         numbered_img.save(numbered_img_path)
 
@@ -479,7 +522,7 @@ def run_test():
                 "bbox": _format_bbox(det["box"]),
             })
 
-        # Build a side panel with a formatted table.
+        # Step 5: Build side-panel table and export final image.
         panel_width = 1300
         output = Image.new("RGB", (width + panel_width, height), color=PANEL_BG)
         output.paste(numbered_img, (0, 0))
@@ -488,7 +531,7 @@ def run_test():
         panel.text((width + 20, 64), f"Total: {len(table_rows)}", fill=TABLE_SUBTEXT, font=title_sub_font)
         _draw_table(panel, width + 20, 106, table_rows, table_body_font, table_header_font)
 
-        # 5. Save and show the result
+        # Step 6: Persist output and clean temporary assets.
         output.save('output_labeled.jpg')
         output.show()
         if os.path.exists(numbered_img_path):
