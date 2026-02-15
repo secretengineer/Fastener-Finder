@@ -1,6 +1,7 @@
 import ollama
 import json
 import os
+import re
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -21,11 +22,114 @@ TABLE_SUBTEXT = (200, 200, 200)
 
 
 def _extract_json_array(raw_content: str):
-    json_start = raw_content.find('[')
-    json_end = raw_content.rfind(']') + 1
-    if json_start == -1 or json_end == 0:
-        raise ValueError("No JSON array found in model response.")
-    return json.loads(raw_content[json_start:json_end])
+    def _is_detection_list(obj):
+        return isinstance(obj, list) and any(
+            isinstance(it, dict) and ("label" in it or "box_2d" in it) for it in obj
+        )
+
+    def _sanitize_json_text(text):
+        # Remove markdown fences if present.
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", cleaned)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+
+        # Remove trailing commas before ] or }.
+        cleaned = re.sub(r",\s*([\]}])", r"\1", cleaned)
+
+        # Fix malformed numbers like 392.777.777 -> 392.777777
+        def _fix_multi_dot_num(match):
+            token = match.group(0)
+            parts = token.split(".")
+            if len(parts) < 3:
+                return token
+            return parts[0] + "." + "".join(parts[1:])
+
+        cleaned = re.sub(r"-?\d+(?:\.\d+){2,}", _fix_multi_dot_num, cleaned)
+        return cleaned
+
+    def _try_parse_list(text):
+        try:
+            parsed = json.loads(text)
+            if _is_detection_list(parsed):
+                return parsed
+        except Exception:
+            return None
+        return None
+
+    def _balanced_segments(text, open_ch, close_ch):
+        segments = []
+        depth = 0
+        in_str = False
+        esc = False
+        start = -1
+        for i, ch in enumerate(text):
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+
+            if ch == '"':
+                in_str = True
+                continue
+
+            if ch == open_ch:
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == close_ch and depth > 0:
+                depth -= 1
+                if depth == 0 and start != -1:
+                    segments.append(text[start:i + 1])
+                    start = -1
+        return segments
+
+    raw = raw_content.strip()
+
+    # 1) Strict parse if raw is already JSON list.
+    parsed = _try_parse_list(raw)
+    if parsed is not None:
+        return parsed
+
+    # 2) Parse balanced array segments from mixed text.
+    for seg in _balanced_segments(raw, "[", "]"):
+        parsed = _try_parse_list(seg)
+        if parsed is not None:
+            return parsed
+        parsed = _try_parse_list(_sanitize_json_text(seg))
+        if parsed is not None:
+            return parsed
+
+    # 3) Attempt repair from first '[' onward by balancing closing brackets.
+    first_arr = raw.find("[")
+    if first_arr != -1:
+        frag = raw[first_arr:]
+        frag = _sanitize_json_text(frag)
+        missing = frag.count("[") - frag.count("]")
+        if missing > 0:
+            frag += "]" * missing
+        parsed = _try_parse_list(frag)
+        if parsed is not None:
+            return parsed
+
+    # 4) Last-resort recovery: parse individual object fragments and keep detection-like dicts.
+    recovered = []
+    for obj_txt in _balanced_segments(raw, "{", "}"):
+        fixed = _sanitize_json_text(obj_txt)
+        try:
+            obj = json.loads(fixed)
+            if isinstance(obj, dict) and "label" in obj and "box_2d" in obj:
+                recovered.append(obj)
+        except Exception:
+            continue
+    if recovered:
+        return recovered
+
+    raise ValueError("No recoverable JSON detections found in model response.")
 
 
 def _to_float(value, default=0.0):
