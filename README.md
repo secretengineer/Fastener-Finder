@@ -75,7 +75,7 @@ flowchart TD
     G --> H[Pass 2: Enrichment Model via Ollama]
     H --> I[Refined label + specification + confidence per ID]
     I --> J[Table Composer]
-    J --> K[ID | Label | Specification | Conf | Box (px)]
+    J --> K["Table: ID, Label, Specification, Conf, Box (px)"]
     K --> L[output_labeled.jpg]
 ```
 
