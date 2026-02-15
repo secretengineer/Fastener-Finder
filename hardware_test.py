@@ -1,8 +1,23 @@
 import ollama
 import json
 import os
-import textwrap
+
 from PIL import Image, ImageDraw, ImageFont
+
+# Visual style constants
+BOX_COLOR = (230, 40, 40)
+BOX_WIDTH = 4
+ID_BADGE_FILL = (230, 40, 40)
+ID_BADGE_OUTLINE = (255, 255, 255)
+ID_TEXT_COLOR = (255, 255, 255)
+PANEL_BG = (18, 18, 18)
+TABLE_HEADER_BG = (60, 60, 60)
+TABLE_ROW_A = (24, 24, 24)
+TABLE_ROW_B = (36, 36, 36)
+TABLE_GRID = (90, 90, 90)
+TABLE_BORDER = (130, 130, 130)
+TABLE_TEXT = (255, 255, 255)
+TABLE_SUBTEXT = (200, 200, 200)
 
 
 def _extract_json_array(raw_content: str):
@@ -92,43 +107,90 @@ def _format_bbox(box):
     return f"({int(left)},{int(top)})-({int(right)},{int(bottom)})"
 
 
+def _fit_text(draw, text, font, max_width):
+    s = str(text)
+    if draw.textlength(s, font=font) <= max_width:
+        return s
+    ellipsis = "..."
+    if draw.textlength(ellipsis, font=font) > max_width:
+        return ""
+    lo, hi = 0, len(s)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        candidate = s[:mid] + ellipsis
+        if draw.textlength(candidate, font=font) <= max_width:
+            lo = mid
+        else:
+            hi = mid - 1
+    return s[:lo] + ellipsis
+
+
+def _wrap_text_by_pixels(draw, text, font, max_width, max_lines):
+    words = str(text).split()
+    if not words:
+        return [""]
+    lines = []
+    current = words[0]
+    for w in words[1:]:
+        test = f"{current} {w}"
+        if draw.textlength(test, font=font) <= max_width:
+            current = test
+        else:
+            lines.append(current)
+            current = w
+    lines.append(current)
+    if len(lines) <= max_lines:
+        return lines
+    clipped = lines[:max_lines]
+    clipped[-1] = _fit_text(draw, clipped[-1], font, max_width)
+    return clipped
+
+
 def _draw_table(draw, x_start, y_start, rows, font, header_font):
     headers = ["ID", "Label", "Specification", "Conf", "Box (px)"]
-    col_widths = [40, 120, 280, 55, 260]
-    row_height = 44
+    col_widths = [70, 190, 430, 95, 340]
+    row_height = 64
     table_width = sum(col_widths)
-    header_h = 48
+    header_h = 56
+    pad = 10
 
     # Header band
-    draw.rectangle([x_start, y_start, x_start + table_width, y_start + header_h], fill=(60, 60, 60))
+    draw.rectangle([x_start, y_start, x_start + table_width, y_start + header_h], fill=TABLE_HEADER_BG)
     x = x_start
     for i, header in enumerate(headers):
-        draw.text((x + 6, y_start + 12), header, fill="white", font=header_font)
+        draw.text((x + pad, y_start + 14), header, fill=TABLE_TEXT, font=header_font)
         x += col_widths[i]
-        draw.line([(x, y_start), (x, y_start + header_h + row_height * len(rows))], fill=(90, 90, 90), width=1)
+        draw.line([(x, y_start), (x, y_start + header_h + row_height * len(rows))], fill=TABLE_GRID, width=1)
 
-    draw.rectangle([x_start, y_start, x_start + table_width, y_start + header_h + row_height * len(rows)], outline=(130, 130, 130), width=1)
-    draw.line([(x_start, y_start + header_h), (x_start + table_width, y_start + header_h)], fill=(130, 130, 130), width=1)
+    draw.rectangle([x_start, y_start, x_start + table_width, y_start + header_h + row_height * len(rows)], outline=TABLE_BORDER, width=1)
+    draw.line([(x_start, y_start + header_h), (x_start + table_width, y_start + header_h)], fill=TABLE_BORDER, width=1)
 
     # Rows
     y = y_start + header_h
     for row in rows:
-        stripe = (36, 36, 36) if (row["id"] % 2 == 0) else (24, 24, 24)
+        stripe = TABLE_ROW_B if (row["id"] % 2 == 0) else TABLE_ROW_A
         draw.rectangle([x_start, y, x_start + table_width, y + row_height], fill=stripe)
         draw.line([(x_start, y + row_height), (x_start + table_width, y + row_height)], fill=(55, 55, 55), width=1)
 
-        spec_lines = textwrap.wrap(row["specification"], width=40)
-        spec_text = "\n".join(spec_lines[:2])
         x = x_start
-        draw.text((x + 8, y + 12), str(row["id"]), fill="white", font=font)
+        id_text = _fit_text(draw, row["id"], font, col_widths[0] - 2 * pad)
+        draw.text((x + pad, y + 18), id_text, fill=TABLE_TEXT, font=font)
         x += col_widths[0]
-        draw.text((x + 8, y + 12), row["label"], fill="white", font=font)
+
+        label_text = _fit_text(draw, row["label"], font, col_widths[1] - 2 * pad)
+        draw.text((x + pad, y + 18), label_text, fill=TABLE_TEXT, font=font)
         x += col_widths[1]
-        draw.multiline_text((x + 8, y + 6), spec_text, fill="white", font=font, spacing=3)
+
+        spec_lines = _wrap_text_by_pixels(draw, row["specification"], font, col_widths[2] - 2 * pad, max_lines=2)
+        draw.multiline_text((x + pad, y + 10), "\n".join(spec_lines), fill=TABLE_TEXT, font=font, spacing=4)
         x += col_widths[2]
-        draw.text((x + 8, y + 12), row["confidence"], fill="white", font=font)
+
+        conf_text = _fit_text(draw, row["confidence"], font, col_widths[3] - 2 * pad)
+        draw.text((x + pad, y + 18), conf_text, fill=TABLE_TEXT, font=font)
         x += col_widths[3]
-        draw.text((x + 8, y + 12), row["bbox"], fill="white", font=font)
+
+        bbox_text = _fit_text(draw, row["bbox"], font, col_widths[4] - 2 * pad)
+        draw.text((x + pad, y + 18), bbox_text, fill=TABLE_TEXT, font=font)
         y += row_height
 
 
@@ -136,15 +198,20 @@ def _draw_numbered_detections(img, detections, font, id_font):
     draw = ImageDraw.Draw(img)
     for i, det in enumerate(detections, 1):
         left, top, right, bottom = det["box"]
-        draw.rectangle([left, top, right, bottom], outline="red", width=3)
-        tag_r = 22
+        draw.rectangle([left, top, right, bottom], outline=BOX_COLOR, width=BOX_WIDTH)
         cx, cy = int(left + 24), int(max(24, top + 24))
-        draw.ellipse([cx - tag_r, cy - tag_r, cx + tag_r, cy + tag_r], fill="red", outline="white", width=2)
         txt = str(i)
         bbox = draw.textbbox((0, 0), txt, font=id_font)
         tw = bbox[2] - bbox[0]
         th = bbox[3] - bbox[1]
-        draw.text((cx - tw / 2, cy - th / 2 - 1), txt, fill="white", font=id_font)
+        tag_r = max(24, int(max(tw, th) / 2) + 10)
+        draw.ellipse(
+            [cx - tag_r, cy - tag_r, cx + tag_r, cy + tag_r],
+            fill=ID_BADGE_FILL,
+            outline=ID_BADGE_OUTLINE,
+            width=2,
+        )
+        draw.text((cx - tw / 2, cy - th / 2 - 1), txt, fill=ID_TEXT_COLOR, font=id_font)
 
 
 def _heuristic_specification(label, box, width, height):
@@ -244,9 +311,9 @@ def run_test():
     # 4. Parse the JSON (Models often wrap JSON in code blocks)
     try:
         data = _extract_json_array(raw_content)
-        font = _load_font(21)
-        header_font = _load_font(24)
-        id_font = _load_font(22)
+        font = _load_font(28)
+        header_font = _load_font(30)
+        id_font = _load_font(34)
         detections = []
 
         for entry in data:
@@ -295,12 +362,12 @@ def run_test():
             })
 
         # Build a side panel with a formatted table.
-        panel_width = 980
-        output = Image.new("RGB", (width + panel_width, height), color=(18, 18, 18))
+        panel_width = 1150
+        output = Image.new("RGB", (width + panel_width, height), color=PANEL_BG)
         output.paste(numbered_img, (0, 0))
         panel = ImageDraw.Draw(output)
-        panel.text((width + 20, 20), "Fastener Detections", fill="white", font=header_font)
-        panel.text((width + 20, 54), f"Total: {len(table_rows)}", fill=(200, 200, 200), font=font)
+        panel.text((width + 20, 20), "Fastener Detections", fill=TABLE_TEXT, font=header_font)
+        panel.text((width + 20, 60), f"Total: {len(table_rows)}", fill=TABLE_SUBTEXT, font=font)
         _draw_table(panel, width + 20, 94, table_rows, font, header_font)
 
         # 5. Save and show the result
